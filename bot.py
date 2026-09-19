@@ -1,111 +1,194 @@
 import os
 import random
-import sqlite3
 import telebot
+import psycopg2
+from psycopg2 import pool
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 ADMIN_USERNAME = "flaybbe"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+ADMIN_ID2 = int(os.environ.get("ADMIN_ID2", 0))
+
+ADMINS = [x for x in [ADMIN_ID, ADMIN_ID2] if x]
+
+def is_admin(uid):
+    return uid in ADMINS
 
 bot = telebot.TeleBot(TOKEN)
 
-# ---------- БАЗА ----------
-conn = sqlite3.connect("clicker.db", check_same_thread=False)
-cur = conn.cursor()
+# ---------- ПУЛ СОЕДИНЕНИЙ ----------
+db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    first_name TEXT,
-    balance INTEGER DEFAULT 0,
-    total_clicks INTEGER DEFAULT 0,
-    banned INTEGER DEFAULT 0
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS promos (
-    code TEXT PRIMARY KEY,
-    amount INTEGER,
-    max_uses INTEGER,
-    uses INTEGER DEFAULT 0
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS promo_used (
-    code TEXT,
-    user_id INTEGER,
-    PRIMARY KEY (code, user_id)
-)
-""")
-conn.commit()
+def get_conn():
+    return db_pool.getconn()
+
+def release_conn(conn):
+    db_pool.putconn(conn)
+
+# ---------- ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ----------
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        balance BIGINT DEFAULT 0,
+        total_clicks BIGINT DEFAULT 0,
+        banned INTEGER DEFAULT 0
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS promos (
+        code TEXT PRIMARY KEY,
+        amount BIGINT,
+        max_uses BIGINT,
+        uses BIGINT DEFAULT 0
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS promo_used (
+        code TEXT,
+        user_id BIGINT,
+        PRIMARY KEY (code, user_id)
+    )
+    """)
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+init_db()
 
 # ---------- ЮЗЕРЫ ----------
 def get_user(uid):
-    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row
 
 def create_user(uid, username, first_name):
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?,?,?)",
-                (uid, username, first_name))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, username, first_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE
+        SET username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name
+    """, (uid, username, first_name))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def is_banned(uid):
     u = get_user(uid)
     return u and u[5] == 1
 
 def add_balance(uid, amount):
-    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, uid))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def add_clicks(uid, amount):
-    cur.execute("UPDATE users SET balance = balance + ?, total_clicks = total_clicks + ? WHERE user_id=?",
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + %s, total_clicks = total_clicks + %s WHERE user_id=%s",
                 (amount, amount, uid))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def add_click(uid):
-    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=?", (uid,))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=%s", (uid,))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def find_by_username(username):
+    conn = get_conn()
+    cur = conn.cursor()
     username = username.replace("@", "").lower()
-    cur.execute("SELECT user_id FROM users WHERE LOWER(username)=?", (username,))
+    cur.execute("SELECT user_id FROM users WHERE LOWER(username)=%s", (username,))
     row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
     return row[0] if row else None
 
 def set_ban(uid, banned):
-    cur.execute("UPDATE users SET banned=? WHERE user_id=?", (banned, uid))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET banned=%s WHERE user_id=%s", (banned, uid))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def get_top(limit=10):
-    cur.execute("SELECT first_name, username, total_clicks FROM users ORDER BY total_clicks DESC LIMIT ?", (limit,))
-    return cur.fetchall()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT first_name, username, total_clicks FROM users ORDER BY total_clicks DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    release_conn(conn)
+    return rows
 
 def get_all_users():
+    conn = get_conn()
+    cur = conn.cursor()
     cur.execute("SELECT user_id FROM users")
-    return [r[0] for r in cur.fetchall()]
+    rows = [r[0] for r in cur.fetchall()]
+    cur.close()
+    release_conn(conn)
+    return rows
 
 # ---------- ПРОМО ----------
 def create_promo(code, amount, max_uses):
     try:
-        cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (?,?,?,0)",
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (%s,%s,%s,0)",
                     (code.upper(), amount, max_uses))
         conn.commit()
+        cur.close()
+        release_conn(conn)
         return True
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cur.close()
+        release_conn(conn)
         return False
 
 def get_promo(code):
-    cur.execute("SELECT code, amount, max_uses, uses FROM promos WHERE code=?", (code.upper(),))
-    return cur.fetchone()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT code, amount, max_uses, uses FROM promos WHERE code=%s", (code.upper(),))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row
 
 def promo_already_used(code, uid):
-    cur.execute("SELECT 1 FROM promo_used WHERE code=? AND user_id=?", (code.upper(), uid))
-    return cur.fetchone() is not None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM promo_used WHERE code=%s AND user_id=%s", (code.upper(), uid))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row is not None
 
 def activate_promo(code, uid):
     p = get_promo(code)
@@ -115,20 +198,33 @@ def activate_promo(code, uid):
         return "❌ Промокод закончился."
     if promo_already_used(code, uid):
         return "❌ Ты уже активировал этот промокод."
-    cur.execute("UPDATE promos SET uses = uses + 1 WHERE code=?", (code.upper(),))
-    cur.execute("INSERT INTO promo_used (code, user_id) VALUES (?,?)", (code.upper(), uid))
-    add_balance(uid, p[1])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE promos SET uses = uses + 1 WHERE code=%s", (code.upper(),))
+    cur.execute("INSERT INTO promo_used (code, user_id) VALUES (%s,%s)", (code.upper(), uid))
     conn.commit()
+    cur.close()
+    release_conn(conn)
+    add_balance(uid, p[1])
     return f"✅ Промокод активирован! +${p[1]}"
 
 def delete_promo(code):
-    cur.execute("DELETE FROM promos WHERE code=?", (code.upper(),))
-    cur.execute("DELETE FROM promo_used WHERE code=?", (code.upper(),))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM promos WHERE code=%s", (code.upper(),))
+    cur.execute("DELETE FROM promo_used WHERE code=%s", (code.upper(),))
     conn.commit()
+    cur.close()
+    release_conn(conn)
 
 def list_promos():
+    conn = get_conn()
+    cur = conn.cursor()
     cur.execute("SELECT code, amount, max_uses, uses FROM promos")
-    return cur.fetchall()
+    rows = cur.fetchall()
+    cur.close()
+    release_conn(conn)
+    return rows
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu(uid):
@@ -137,7 +233,7 @@ def main_menu(uid):
     kb.row(KeyboardButton("👤 Мой профиль"), KeyboardButton("🏆 Топ кликеров"))
     kb.row(KeyboardButton("💵 Пополнить $"), KeyboardButton("🎭 Докс"))
     kb.row(KeyboardButton("🎟 Промокод"), KeyboardButton("🆘 Поддержка"))
-    if uid == ADMIN_ID:
+    if is_admin(uid):
         kb.row(KeyboardButton("🔧 Админ-панель"))
     return kb
 
@@ -207,7 +303,7 @@ def click(message):
     u = get_user(uid)
     bot.send_message(uid, f"💵 +$1\nБаланс: ${u[3]}")
 
-# ---------- 🎭 ДОКС (на себя) ----------
+# ---------- 🎭 ДОКС ----------
 @bot.message_handler(func=lambda m: m.text == "🎭 Докс")
 def doks_self(message):
     uid = message.from_user.id
@@ -220,16 +316,12 @@ def doks_self(message):
         return
 
     tg = message.from_user
-
     first = tg.first_name or "—"
     last = tg.last_name or ""
     full_name = f"{first} {last}".strip() if last else first
     username = f"@{tg.username}" if tg.username else "—"
     lang = tg.language_code or "—"
     premium = "Да ⭐" if getattr(tg, "is_premium", False) else "Нет"
-
-    balance = u[3]
-    clicks = u[4]
 
     cities = ["Москва", "Санкт-Петербург", "Казань", "Сочи", "Омск", "Тверь", "Уфа", "Пермь"]
     streets = ["Ленина", "Пушкина", "Гагарина", "Мира", "Садовая", "Советская", "Центральная"]
@@ -249,8 +341,8 @@ def doks_self(message):
         f"🆔 ID: <code>{uid}</code>\n"
         f"🌐 Язык: {lang}\n"
         f"⭐ Premium: {premium}\n"
-        f"💰 Баланс: ${balance}\n"
-        f"👆 Кликов: {clicks}\n\n"
+        f"💰 Баланс: ${u[3]}\n"
+        f"👆 Кликов: {u[4]}\n\n"
         f"🎲 <b>ВЫМЫШЛЕННЫЕ:</b>\n"
         f"📱 Телефон: {fake_phone}\n"
         f"🏙 Адрес: {fake_city}\n"
@@ -261,7 +353,7 @@ def doks_self(message):
     )
     bot.send_message(uid, text, parse_mode="HTML", reply_markup=main_menu(uid))
 
-# ---------- 🎟 ПРОМОКОД (игрок) ----------
+# ---------- 🎟 ПРОМОКОД ----------
 @bot.message_handler(func=lambda m: m.text == "🎟 Промокод")
 def promo_enter(message):
     uid = message.from_user.id
@@ -335,7 +427,7 @@ def send_support(message):
     if message.text == "🔙 В меню":
         bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu(message.from_user.id))
         return
-    if not ADMIN_ID:
+    if not ADMINS:
         bot.send_message(message.chat.id, f"Напишите напрямую: @{ADMIN_USERNAME}")
         return
     uname = f"@{message.from_user.username}" if message.from_user.username else "—"
@@ -345,7 +437,11 @@ def send_support(message):
         f"Имя: {message.from_user.first_name}\n\n"
         f"Сообщение:\n{message.text}"
     )
-    bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    for adm in ADMINS:
+        try:
+            bot.send_message(adm, text, parse_mode="HTML")
+        except:
+            pass
     bot.send_message(message.chat.id, "✅ Отправлено администратору.", reply_markup=main_menu(message.from_user.id))
 
 # ---------- 🔙 В МЕНЮ ----------
@@ -356,14 +452,13 @@ def back(message):
 # ---------- 🔧 АДМИН ----------
 @bot.message_handler(func=lambda m: m.text == "🔧 Админ-панель")
 def admin(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "🔧 Админ-панель", reply_markup=admin_menu())
 
-# --- Выдать $ ---
 @bot.message_handler(func=lambda m: m.text == "💰 Выдать $")
 def give_money(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
     bot.register_next_step_handler(message, give_money_step1)
@@ -380,6 +475,8 @@ def give_money_step1(message):
     bot.register_next_step_handler(message, lambda m: give_money_step2(m, target))
 
 def give_money_step2(message, target):
+    if not is_admin(message.from_user.id):
+        return
     try:
         amount = int(message.text)
     except:
@@ -395,10 +492,9 @@ def give_money_step2(message, target):
     except:
         pass
 
-# --- Выдать клики ---
 @bot.message_handler(func=lambda m: m.text == "🎯 Выдать клики")
 def give_clicks(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
     bot.register_next_step_handler(message, give_clicks_step1)
@@ -415,6 +511,8 @@ def give_clicks_step1(message):
     bot.register_next_step_handler(message, lambda m: give_clicks_step2(m, target))
 
 def give_clicks_step2(message, target):
+    if not is_admin(message.from_user.id):
+        return
     try:
         amount = int(message.text)
     except:
@@ -430,16 +528,15 @@ def give_clicks_step2(message, target):
     except:
         pass
 
-# --- Промокоды ---
 @bot.message_handler(func=lambda m: m.text == "🎟 Промокоды")
 def promos_admin(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "🎟 Управление промокодами", reply_markup=promos_admin_menu())
 
 @bot.message_handler(func=lambda m: m.text == "📋 Список промокодов")
 def promos_list(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     rows = list_promos()
     if not rows:
@@ -453,7 +550,7 @@ def promos_list(message):
 
 @bot.message_handler(func=lambda m: m.text == "➕ Создать промокод")
 def promo_create(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи название промокода (например: WELCOME):", reply_markup=back_menu())
     bot.register_next_step_handler(message, promo_create_step1)
@@ -497,7 +594,7 @@ def promo_create_step3(message, code, amount):
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Удалить промокод")
 def promo_delete(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи название промокода для удаления:", reply_markup=back_menu())
     bot.register_next_step_handler(message, promo_delete_step)
@@ -516,14 +613,13 @@ def promo_delete_step(message):
 
 @bot.message_handler(func=lambda m: m.text == "🔙 Назад")
 def promos_back(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "🔧 Админ-панель", reply_markup=admin_menu())
 
-# --- Рассылка ---
 @bot.message_handler(func=lambda m: m.text == "📢 Рассылка")
 def broadcast(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи текст рассылки:", reply_markup=back_menu())
     bot.register_next_step_handler(message, broadcast_step)
@@ -542,10 +638,9 @@ def broadcast_step(message):
             pass
     bot.send_message(message.chat.id, f"✅ Разослано {ok}", reply_markup=admin_menu())
 
-# --- Бан / Разбан ---
 @bot.message_handler(func=lambda m: m.text == "🚫 Забанить")
 def ban(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
     bot.register_next_step_handler(message, ban_step)
@@ -567,7 +662,7 @@ def ban_step(message):
 
 @bot.message_handler(func=lambda m: m.text == "✅ Разбанить")
 def unban(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
     bot.register_next_step_handler(message, unban_step)
@@ -587,7 +682,7 @@ def unban_step(message):
     except:
         pass
 
-# ---------- FALLBACK (автообновление меню) ----------
+# ---------- FALLBACK ----------
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def fallback(message):
     uid = message.from_user.id
@@ -596,5 +691,5 @@ def fallback(message):
     bot.send_message(uid, "Выбери действие 👇", reply_markup=main_menu(uid))
 
 # ---------- ЗАПУСК ----------
-print("Бот запущен...")
+print("Бот запущен... Подключение к PostgreSQL...")
 bot.infinity_polling()
