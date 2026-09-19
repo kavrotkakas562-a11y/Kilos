@@ -1,0 +1,695 @@
+import os
+import random
+import telebot
+import psycopg2
+from psycopg2 import pool
+from telebot.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+
+TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+ADMIN_USERNAME = "flaybbe"
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+ADMIN_ID2 = int(os.environ.get("ADMIN_ID2", 0))
+
+ADMINS = [x for x in [ADMIN_ID, ADMIN_ID2] if x]
+
+def is_admin(uid):
+    return uid in ADMINS
+
+bot = telebot.TeleBot(TOKEN)
+
+# ---------- ПУЛ СОЕДИНЕНИЙ ----------
+db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+
+def get_conn():
+    return db_pool.getconn()
+
+def release_conn(conn):
+    db_pool.putconn(conn)
+
+# ---------- ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ----------
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        balance BIGINT DEFAULT 0,
+        total_clicks BIGINT DEFAULT 0,
+        banned INTEGER DEFAULT 0
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS promos (
+        code TEXT PRIMARY KEY,
+        amount BIGINT,
+        max_uses BIGINT,
+        uses BIGINT DEFAULT 0
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS promo_used (
+        code TEXT,
+        user_id BIGINT,
+        PRIMARY KEY (code, user_id)
+    )
+    """)
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+init_db()
+
+# ---------- ЮЗЕРЫ ----------
+def get_user(uid):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=%s", (uid,))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row
+
+def create_user(uid, username, first_name):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, username, first_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE
+        SET username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name
+    """, (uid, username, first_name))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def is_banned(uid):
+    u = get_user(uid)
+    return u and u[5] == 1
+
+def add_balance(uid, amount):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, uid))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def add_clicks(uid, amount):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + %s, total_clicks = total_clicks + %s WHERE user_id=%s",
+                (amount, amount, uid))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def add_click(uid):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=%s", (uid,))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def find_by_username(username):
+    conn = get_conn()
+    cur = conn.cursor()
+    username = username.replace("@", "").lower()
+    cur.execute("SELECT user_id FROM users WHERE LOWER(username)=%s", (username,))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row[0] if row else None
+
+def set_ban(uid, banned):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET banned=%s WHERE user_id=%s", (banned, uid))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def get_top(limit=10):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT first_name, username, total_clicks FROM users ORDER BY total_clicks DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    release_conn(conn)
+    return rows
+
+def get_all_users():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    rows = [r[0] for r in cur.fetchall()]
+    cur.close()
+    release_conn(conn)
+    return rows
+
+# ---------- ПРОМО ----------
+def create_promo(code, amount, max_uses):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (%s,%s,%s,0)",
+                    (code.upper(), amount, max_uses))
+        conn.commit()
+        cur.close()
+        release_conn(conn)
+        return True
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cur.close()
+        release_conn(conn)
+        return False
+
+def get_promo(code):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT code, amount, max_uses, uses FROM promos WHERE code=%s", (code.upper(),))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row
+
+def promo_already_used(code, uid):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM promo_used WHERE code=%s AND user_id=%s", (code.upper(), uid))
+    row = cur.fetchone()
+    cur.close()
+    release_conn(conn)
+    return row is not None
+
+def activate_promo(code, uid):
+    p = get_promo(code)
+    if not p:
+        return "❌ Промокод не найден."
+    if p[2] != -1 and p[3] >= p[2]:
+        return "❌ Промокод закончился."
+    if promo_already_used(code, uid):
+        return "❌ Ты уже активировал этот промокод."
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE promos SET uses = uses + 1 WHERE code=%s", (code.upper(),))
+    cur.execute("INSERT INTO promo_used (code, user_id) VALUES (%s,%s)", (code.upper(), uid))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+    add_balance(uid, p[1])
+    return f"✅ Промокод активирован! +${p[1]}"
+
+def delete_promo(code):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM promos WHERE code=%s", (code.upper(),))
+    cur.execute("DELETE FROM promo_used WHERE code=%s", (code.upper(),))
+    conn.commit()
+    cur.close()
+    release_conn(conn)
+
+def list_promos():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT code, amount, max_uses, uses FROM promos")
+    rows = cur.fetchall()
+    cur.close()
+    release_conn(conn)
+    return rows
+
+# ---------- КЛАВИАТУРЫ ----------
+def main_menu(uid):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("💰 Играть"))
+    kb.row(KeyboardButton("👤 Мой профиль"), KeyboardButton("🏆 Топ кликеров"))
+    kb.row(KeyboardButton("💵 Пополнить $"), KeyboardButton("🎭 Докс"))
+    kb.row(KeyboardButton("🎟 Промокод"), KeyboardButton("🆘 Поддержка"))
+    if is_admin(uid):
+        kb.row(KeyboardButton("🔧 Админ-панель"))
+    return kb
+
+def clicker_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("💵 Кликнуть (+$1)"))
+    kb.row(KeyboardButton("🔙 В меню"))
+    return kb
+
+def back_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("🔙 В меню"))
+    return kb
+
+def admin_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("💰 Выдать $"))
+    kb.row(KeyboardButton("🎯 Выдать клики"))
+    kb.row(KeyboardButton("📢 Рассылка"))
+    kb.row(KeyboardButton("🚫 Забанить"), KeyboardButton("✅ Разбанить"))
+    kb.row(KeyboardButton("🎟 Промокоды"))
+    kb.row(KeyboardButton("🔙 В меню"))
+    return kb
+
+def promos_admin_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("➕ Создать промокод"))
+    kb.row(KeyboardButton("🗑 Удалить промокод"))
+    kb.row(KeyboardButton("📋 Список промокодов"))
+    kb.row(KeyboardButton("🔙 Назад"))
+    return kb
+
+# ---------- /start ----------
+@bot.message_handler(commands=["start"])
+def start(message):
+    uid = message.from_user.id
+    create_user(uid, message.from_user.username, message.from_user.first_name)
+
+    if is_banned(uid):
+        bot.send_message(uid, "🚫 Вы забанены и не можете пользоваться ботом.")
+        return
+
+    bot.send_message(
+        uid,
+        f"Привет, {message.from_user.first_name}!\n\n"
+        "Это долларовый кликер 💵\n"
+        "Жми «💰 Играть» и зарабатывай!",
+        reply_markup=main_menu(uid)
+    )
+
+# ---------- 💰 ИГРАТЬ ----------
+@bot.message_handler(func=lambda m: m.text == "💰 Играть")
+def play(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        bot.send_message(uid, "🚫 Вы забанены.")
+        return
+    u = get_user(uid)
+    bot.send_message(uid, f"💵 Баланс: ${u[3]}\n\nЖми кнопку и зарабатывай!", reply_markup=clicker_kb())
+
+@bot.message_handler(func=lambda m: m.text == "💵 Кликнуть (+$1)")
+def click(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    add_click(uid)
+    u = get_user(uid)
+    bot.send_message(uid, f"💵 +$1\nБаланс: ${u[3]}")
+
+# ---------- 🎭 ДОКС ----------
+@bot.message_handler(func=lambda m: m.text == "🎭 Докс")
+def doks_self(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+
+    u = get_user(uid)
+    if not u:
+        bot.send_message(uid, "Сначала /start")
+        return
+
+    tg = message.from_user
+    first = tg.first_name or "—"
+    last = tg.last_name or ""
+    full_name = f"{first} {last}".strip() if last else first
+    username = f"@{tg.username}" if tg.username else "—"
+    lang = tg.language_code or "—"
+    premium = "Да ⭐" if getattr(tg, "is_premium", False) else "Нет"
+
+    cities = ["Москва", "Санкт-Петербург", "Казань", "Сочи", "Омск", "Тверь", "Уфа", "Пермь"]
+    streets = ["Ленина", "Пушкина", "Гагарина", "Мира", "Садовая", "Советская", "Центральная"]
+    domains = ["mail.ru", "gmail.com", "yandex.ru", "bk.ru"]
+
+    fake_phone = f"+7 9{random.randint(10,99)} {random.randint(100,999)}-{random.randint(10,99)}-{random.randint(10,99)}"
+    fake_city = f"{random.choice(cities)}, ул. {random.choice(streets)}, д. {random.randint(1, 120)}"
+    fake_card = f"4276 **** **** {random.randint(1000,9999)}"
+    fake_pass = f"{random.choice(['qwerty','123456','pass','admin','love'])}{random.randint(10,99)}"
+    fake_email = f"{random.choice(['user','admin','mail','test'])}{random.randint(100,999)}@{random.choice(domains)}"
+
+    text = (
+        f"🎭 <b>Докс на тебя</b>\n\n"
+        f"✅ <b>РЕАЛЬНЫЕ ДАННЫЕ:</b>\n"
+        f"👤 Имя: {full_name}\n"
+        f"🔗 Юзернейм: {username}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"🌐 Язык: {lang}\n"
+        f"⭐ Premium: {premium}\n"
+        f"💰 Баланс: ${u[3]}\n"
+        f"👆 Кликов: {u[4]}\n\n"
+        f"🎲 <b>ВЫМЫШЛЕННЫЕ:</b>\n"
+        f"📱 Телефон: {fake_phone}\n"
+        f"🏙 Адрес: {fake_city}\n"
+        f"📧 Email: {fake_email}\n"
+        f"💳 Карта: {fake_card}\n"
+        f"🔐 Пароль: {fake_pass}\n\n"
+        f"⚠️ Всё, что ниже «ВЫМЫШЛЕННЫЕ» — сгенерировано случайно."
+    )
+    bot.send_message(uid, text, parse_mode="HTML", reply_markup=main_menu(uid))
+
+# ---------- 🎟 ПРОМОКОД ----------
+@bot.message_handler(func=lambda m: m.text == "🎟 Промокод")
+def promo_enter(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    bot.send_message(message.chat.id, "🎟 Введи промокод:", reply_markup=back_menu())
+    bot.register_next_step_handler(message, promo_activate)
+
+def promo_activate(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    result = activate_promo(message.text.strip(), message.from_user.id)
+    bot.send_message(message.chat.id, result, reply_markup=main_menu(message.from_user.id))
+
+# ---------- 👤 ПРОФИЛЬ ----------
+@bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
+def profile(message):
+    uid = message.from_user.id
+    u = get_user(uid)
+    if not u:
+        bot.send_message(uid, "Сначала /start")
+        return
+    uname = f"@{u[1]}" if u[1] else "—"
+    status = "🚫 Забанен" if u[5] else "✅ Активен"
+    bot.send_message(
+        uid,
+        f"👤 <b>Профиль</b>\n\n"
+        f"Имя: {u[2]}\n"
+        f"Юзернейм: {uname}\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Баланс: ${u[3]}\n"
+        f"Всего накликано: {u[4]}\n"
+        f"Статус: {status}",
+        parse_mode="HTML"
+    )
+
+# ---------- 🏆 ТОП ----------
+@bot.message_handler(func=lambda m: m.text == "🏆 Топ кликеров")
+def top(message):
+    rows = get_top(10)
+    if not rows:
+        bot.send_message(message.chat.id, "Пока никого нет.")
+        return
+    text = "🏆 <b>Топ-10 кликеров</b>\n\n"
+    for i, (name, uname, clicks) in enumerate(rows, 1):
+        u = f"@{uname}" if uname else name
+        text += f"{i}. {u} — {clicks} кликов\n"
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+# ---------- 💵 ПОПОЛНИТЬ ----------
+@bot.message_handler(func=lambda m: m.text == "💵 Пополнить $")
+def top_up(message):
+    text = (
+        "💵 <b>Пополнение баланса</b>\n\n"
+        "$1 — 10₽\n"
+        "Максимум за 1 раз: $10000\n\n"
+        f"Чтобы купить — напишите: @{ADMIN_USERNAME}"
+    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(f"✍️ Написать @{ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME}"))
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+
+# ---------- 🆘 ПОДДЕРЖКА ----------
+@bot.message_handler(func=lambda m: m.text == "🆘 Поддержка")
+def support(message):
+    bot.send_message(message.chat.id, "📨 Напишите свою жалобу или вопрос:", reply_markup=back_menu())
+    bot.register_next_step_handler(message, send_support)
+
+def send_support(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    if not ADMINS:
+        bot.send_message(message.chat.id, f"Напишите напрямую: @{ADMIN_USERNAME}")
+        return
+    uname = f"@{message.from_user.username}" if message.from_user.username else "—"
+    text = (
+        f"🆘 <b>Обращение в поддержку</b>\n\n"
+        f"От: {uname} (ID: <code>{message.from_user.id}</code>)\n"
+        f"Имя: {message.from_user.first_name}\n\n"
+        f"Сообщение:\n{message.text}"
+    )
+    for adm in ADMINS:
+        try:
+            bot.send_message(adm, text, parse_mode="HTML")
+        except:
+            pass
+    bot.send_message(message.chat.id, "✅ Отправлено администратору.", reply_markup=main_menu(message.from_user.id))
+
+# ---------- 🔙 В МЕНЮ ----------
+@bot.message_handler(func=lambda m: m.text == "🔙 В меню")
+def back(message):
+    bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu(message.from_user.id))
+
+# ---------- 🔧 АДМИН ----------
+@bot.message_handler(func=lambda m: m.text == "🔧 Админ-панель")
+def admin(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "🔧 Админ-панель", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "💰 Выдать $")
+def give_money(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
+    bot.register_next_step_handler(message, give_money_step1)
+
+def give_money_step1(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    target = find_by_username(message.text)
+    if not target:
+        bot.send_message(message.chat.id, "❌ Не найден.", reply_markup=admin_menu())
+        return
+    bot.send_message(message.chat.id, "Введи сумму от 1 до 500000:")
+    bot.register_next_step_handler(message, lambda m: give_money_step2(m, target))
+
+def give_money_step2(message, target):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        amount = int(message.text)
+    except:
+        bot.send_message(message.chat.id, "❌ Число.", reply_markup=admin_menu())
+        return
+    if amount < 1 or amount > 500000:
+        bot.send_message(message.chat.id, "❌ 1–500000.", reply_markup=admin_menu())
+        return
+    add_balance(target, amount)
+    bot.send_message(message.chat.id, f"✅ Выдано ${amount}", reply_markup=admin_menu())
+    try:
+        bot.send_message(target, f"💰 Вам выдано ${amount}")
+    except:
+        pass
+
+@bot.message_handler(func=lambda m: m.text == "🎯 Выдать клики")
+def give_clicks(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
+    bot.register_next_step_handler(message, give_clicks_step1)
+
+def give_clicks_step1(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    target = find_by_username(message.text)
+    if not target:
+        bot.send_message(message.chat.id, "❌ Не найден.", reply_markup=admin_menu())
+        return
+    bot.send_message(message.chat.id, "Сколько кликов выдать (1–500000):")
+    bot.register_next_step_handler(message, lambda m: give_clicks_step2(m, target))
+
+def give_clicks_step2(message, target):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        amount = int(message.text)
+    except:
+        bot.send_message(message.chat.id, "❌ Число.", reply_markup=admin_menu())
+        return
+    if amount < 1 or amount > 500000:
+        bot.send_message(message.chat.id, "❌ 1–500000.", reply_markup=admin_menu())
+        return
+    add_clicks(target, amount)
+    bot.send_message(message.chat.id, f"✅ Выдано {amount} кликов", reply_markup=admin_menu())
+    try:
+        bot.send_message(target, f"🎯 Вам начислено {amount} кликов")
+    except:
+        pass
+
+@bot.message_handler(func=lambda m: m.text == "🎟 Промокоды")
+def promos_admin(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "🎟 Управление промокодами", reply_markup=promos_admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "📋 Список промокодов")
+def promos_list(message):
+    if not is_admin(message.from_user.id):
+        return
+    rows = list_promos()
+    if not rows:
+        bot.send_message(message.chat.id, "Промокодов нет.", reply_markup=promos_admin_menu())
+        return
+    text = "🎟 <b>Промокоды:</b>\n\n"
+    for code, amount, max_uses, uses in rows:
+        limit = "∞" if max_uses == -1 else max_uses
+        text += f"<code>{code}</code> — ${amount} — {uses}/{limit}\n"
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=promos_admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "➕ Создать промокод")
+def promo_create(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи название промокода (например: WELCOME):", reply_markup=back_menu())
+    bot.register_next_step_handler(message, promo_create_step1)
+
+def promo_create_step1(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    code = message.text.strip().upper()
+    if get_promo(code):
+        bot.send_message(message.chat.id, "❌ Такой промокод уже есть.", reply_markup=promos_admin_menu())
+        return
+    bot.send_message(message.chat.id, "Сколько $ даёт промокод:")
+    bot.register_next_step_handler(message, lambda m: promo_create_step2(m, code))
+
+def promo_create_step2(message, code):
+    try:
+        amount = int(message.text)
+    except:
+        bot.send_message(message.chat.id, "❌ Число.", reply_markup=promos_admin_menu())
+        return
+    bot.send_message(message.chat.id, "Сколько активаций? (число или -1 для бесконечности):")
+    bot.register_next_step_handler(message, lambda m: promo_create_step3(m, code, amount))
+
+def promo_create_step3(message, code, amount):
+    try:
+        max_uses = int(message.text)
+    except:
+        bot.send_message(message.chat.id, "❌ Число.", reply_markup=promos_admin_menu())
+        return
+    if max_uses != -1 and max_uses < 1:
+        bot.send_message(message.chat.id, "❌ Минимум 1 или -1.", reply_markup=promos_admin_menu())
+        return
+    create_promo(code, amount, max_uses)
+    limit = "∞" if max_uses == -1 else max_uses
+    bot.send_message(
+        message.chat.id,
+        f"✅ Промокод <code>{code}</code> создан.\nСумма: ${amount}\nАктиваций: {limit}",
+        parse_mode="HTML", reply_markup=promos_admin_menu()
+    )
+
+@bot.message_handler(func=lambda m: m.text == "🗑 Удалить промокод")
+def promo_delete(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи название промокода для удаления:", reply_markup=back_menu())
+    bot.register_next_step_handler(message, promo_delete_step)
+
+def promo_delete_step(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    code = message.text.strip().upper()
+    if not get_promo(code):
+        bot.send_message(message.chat.id, "❌ Не найден.", reply_markup=promos_admin_menu())
+        return
+    delete_promo(code)
+    bot.send_message(message.chat.id, f"✅ Промокод <code>{code}</code> удалён.", parse_mode="HTML",
+                     reply_markup=promos_admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔙 Назад")
+def promos_back(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "🔧 Админ-панель", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "📢 Рассылка")
+def broadcast(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи текст рассылки:", reply_markup=back_menu())
+    bot.register_next_step_handler(message, broadcast_step)
+
+def broadcast_step(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    users = get_all_users()
+    ok = 0
+    for uid in users:
+        try:
+            bot.send_message(uid, f"📢 {message.text}")
+            ok += 1
+        except:
+            pass
+    bot.send_message(message.chat.id, f"✅ Разослано {ok}", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🚫 Забанить")
+def ban(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
+    bot.register_next_step_handler(message, ban_step)
+
+def ban_step(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    target = find_by_username(message.text)
+    if not target:
+        bot.send_message(message.chat.id, "❌ Не найден.", reply_markup=admin_menu())
+        return
+    set_ban(target, 1)
+    bot.send_message(message.chat.id, f"🚫 Забанен ID {target}", reply_markup=admin_menu())
+    try:
+        bot.send_message(target, "🚫 Вы забанены.")
+    except:
+        pass
+
+@bot.message_handler(func=lambda m: m.text == "✅ Разбанить")
+def unban(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(message.chat.id, "Введи юзернейм (без @):", reply_markup=back_menu())
+    bot.register_next_step_handler(message, unban_step)
+
+def unban_step(message):
+    if message.text == "🔙 В меню":
+        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        return
+    target = find_by_username(message.text)
+    if not target:
+        bot.send_message(message.chat.id, "❌ Не найден.", reply_markup=admin_menu())
+        return
+    set_ban(target, 0)
+    bot.send_message(message.chat.id, f"✅ Разбанен ID {target}", reply_markup=admin_menu())
+    try:
+        bot.send_message(target, "✅ Вы разбанены.")
+    except:
+        pass
+
+# ---------- FALLBACK ----------
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    bot.send_message(uid, "Выбери действие 👇", reply_markup=main_menu(uid))
+
+# ---------- ЗАПУСК ----------
+print("Бот запущен... Подключение к PostgreSQL...")
+bot.infinity_polling()
