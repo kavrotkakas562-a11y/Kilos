@@ -1,16 +1,13 @@
 import os
 import random
+import sqlite3
 import telebot
-import psycopg
-from psycopg import pool
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
 ADMIN_USERNAME = "flaybbe"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 ADMIN_ID2 = int(os.environ.get("ADMIN_ID2", 0))
@@ -22,172 +19,99 @@ def is_admin(uid):
 
 bot = telebot.TeleBot(TOKEN)
 
-# ---------- ПУЛ СОЕДИНЕНИЙ ----------
-db_pool = pool.ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
+# ---------- БАЗА (SQLite) ----------
+conn = sqlite3.connect("clicker.db", check_same_thread=False)
+cur = conn.cursor()
 
-def get_conn():
-    return db_pool.getconn()
-
-def release_conn(conn):
-    db_pool.putconn(conn)
-
-# ---------- ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ----------
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        balance BIGINT DEFAULT 0,
-        total_clicks BIGINT DEFAULT 0,
-        banned INTEGER DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS promos (
-        code TEXT PRIMARY KEY,
-        amount BIGINT,
-        max_uses BIGINT,
-        uses BIGINT DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS promo_used (
-        code TEXT,
-        user_id BIGINT,
-        PRIMARY KEY (code, user_id)
-    )
-    """)
-    conn.commit()
-    cur.close()
-    release_conn(conn)
-
-init_db()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    balance INTEGER DEFAULT 0,
+    total_clicks INTEGER DEFAULT 0,
+    banned INTEGER DEFAULT 0
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS promos (
+    code TEXT PRIMARY KEY,
+    amount INTEGER,
+    max_uses INTEGER,
+    uses INTEGER DEFAULT 0
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS promo_used (
+    code TEXT,
+    user_id INTEGER,
+    PRIMARY KEY (code, user_id)
+)
+""")
+conn.commit()
 
 # ---------- ЮЗЕРЫ ----------
 def get_user(uid):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=%s", (uid,))
-    row = cur.fetchone()
-    cur.close()
-    release_conn(conn)
-    return row
+    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=?", (uid,))
+    return cur.fetchone()
 
 def create_user(uid, username, first_name):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (user_id, username, first_name)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE
-        SET username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name
-    """, (uid, username, first_name))
+    cur.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?,?,?)",
+                (uid, username, first_name))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def is_banned(uid):
     u = get_user(uid)
     return u and u[5] == 1
 
 def add_balance(uid, amount):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, uid))
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def add_clicks(uid, amount):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + %s, total_clicks = total_clicks + %s WHERE user_id=%s",
+    cur.execute("UPDATE users SET balance = balance + ?, total_clicks = total_clicks + ? WHERE user_id=?",
                 (amount, amount, uid))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def add_click(uid):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=%s", (uid,))
+    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=?", (uid,))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def find_by_username(username):
-    conn = get_conn()
-    cur = conn.cursor()
     username = username.replace("@", "").lower()
-    cur.execute("SELECT user_id FROM users WHERE LOWER(username)=%s", (username,))
+    cur.execute("SELECT user_id FROM users WHERE LOWER(username)=?", (username,))
     row = cur.fetchone()
-    cur.close()
-    release_conn(conn)
     return row[0] if row else None
 
 def set_ban(uid, banned):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET banned=%s WHERE user_id=%s", (banned, uid))
+    cur.execute("UPDATE users SET banned=? WHERE user_id=?", (banned, uid))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def get_top(limit=10):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT first_name, username, total_clicks FROM users ORDER BY total_clicks DESC LIMIT %s", (limit,))
-    rows = cur.fetchall()
-    cur.close()
-    release_conn(conn)
-    return rows
+    cur.execute("SELECT first_name, username, total_clicks FROM users ORDER BY total_clicks DESC LIMIT ?", (limit,))
+    return cur.fetchall()
 
 def get_all_users():
-    conn = get_conn()
-    cur = conn.cursor()
     cur.execute("SELECT user_id FROM users")
-    rows = [r[0] for r in cur.fetchall()]
-    cur.close()
-    release_conn(conn)
-    return rows
+    return [r[0] for r in cur.fetchall()]
 
 # ---------- ПРОМО ----------
 def create_promo(code, amount, max_uses):
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (%s,%s,%s,0)",
+        cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (?,?,?,0)",
                     (code.upper(), amount, max_uses))
         conn.commit()
         return True
-    except psycopg.IntegrityError:
-        conn.rollback()
+    except sqlite3.IntegrityError:
         return False
-    finally:
-        cur.close()
-        release_conn(conn)
 
 def get_promo(code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT code, amount, max_uses, uses FROM promos WHERE code=%s", (code.upper(),))
-    row = cur.fetchone()
-    cur.close()
-    release_conn(conn)
-    return row
+    cur.execute("SELECT code, amount, max_uses, uses FROM promos WHERE code=?", (code.upper(),))
+    return cur.fetchone()
 
 def promo_already_used(code, uid):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM promo_used WHERE code=%s AND user_id=%s", (code.upper(), uid))
-    row = cur.fetchone()
-    cur.close()
-    release_conn(conn)
-    return row is not None
+    cur.execute("SELECT 1 FROM promo_used WHERE code=? AND user_id=?", (code.upper(), uid))
+    return cur.fetchone() is not None
 
 def activate_promo(code, uid):
     p = get_promo(code)
@@ -197,33 +121,20 @@ def activate_promo(code, uid):
         return "❌ Промокод закончился."
     if promo_already_used(code, uid):
         return "❌ Ты уже активировал этот промокод."
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE promos SET uses = uses + 1 WHERE code=%s", (code.upper(),))
-    cur.execute("INSERT INTO promo_used (code, user_id) VALUES (%s,%s)", (code.upper(), uid))
-    conn.commit()
-    cur.close()
-    release_conn(conn)
+    cur.execute("UPDATE promos SET uses = uses + 1 WHERE code=?", (code.upper(),))
+    cur.execute("INSERT INTO promo_used (code, user_id) VALUES (?,?)", (code.upper(), uid))
     add_balance(uid, p[1])
+    conn.commit()
     return f"✅ Промокод активирован! +${p[1]}"
 
 def delete_promo(code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM promos WHERE code=%s", (code.upper(),))
-    cur.execute("DELETE FROM promo_used WHERE code=%s", (code.upper(),))
+    cur.execute("DELETE FROM promos WHERE code=?", (code.upper(),))
+    cur.execute("DELETE FROM promo_used WHERE code=?", (code.upper(),))
     conn.commit()
-    cur.close()
-    release_conn(conn)
 
 def list_promos():
-    conn = get_conn()
-    cur = conn.cursor()
     cur.execute("SELECT code, amount, max_uses, uses FROM promos")
-    rows = cur.fetchall()
-    cur.close()
-    release_conn(conn)
-    return rows
+    return cur.fetchall()
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu(uid):
@@ -690,5 +601,5 @@ def fallback(message):
     bot.send_message(uid, "Выбери действие 👇", reply_markup=main_menu(uid))
 
 # ---------- ЗАПУСК ----------
-print("Бот запущен... Подключение к PostgreSQL...")
+print("Бот запущен...")
 bot.infinity_polling()
