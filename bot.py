@@ -19,6 +19,15 @@ def is_admin(uid):
 
 bot = telebot.TeleBot(TOKEN)
 
+# ---------- УЛУЧШЕНИЯ ----------
+# name: (множитель, цена)
+UPGRADES = {
+    "x2":  {"mult": 2,  "price": 500,      "emoji": "⚡"},
+    "x5":  {"mult": 5,  "price": 5_000,    "emoji": "🔥"},
+    "x10": {"mult": 10, "price": 50_000,   "emoji": "💥"},
+    "x50": {"mult": 50, "price": 500_000,  "emoji": "💎"},
+}
+
 # ---------- БАЗА (SQLite) ----------
 conn = sqlite3.connect("clicker.db", check_same_thread=False)
 cur = conn.cursor()
@@ -30,7 +39,15 @@ CREATE TABLE IF NOT EXISTS users (
     first_name TEXT,
     balance INTEGER DEFAULT 0,
     total_clicks INTEGER DEFAULT 0,
-    banned INTEGER DEFAULT 0
+    banned INTEGER DEFAULT 0,
+    click_mult INTEGER DEFAULT 1
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS user_upgrades (
+    user_id INTEGER,
+    upgrade_key TEXT,
+    PRIMARY KEY (user_id, upgrade_key)
 )
 """)
 cur.execute("""
@@ -52,7 +69,7 @@ conn.commit()
 
 # ---------- ЮЗЕРЫ ----------
 def get_user(uid):
-    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned FROM users WHERE user_id=?", (uid,))
+    cur.execute("SELECT user_id, username, first_name, balance, total_clicks, banned, click_mult FROM users WHERE user_id=?", (uid,))
     return cur.fetchone()
 
 def create_user(uid, username, first_name):
@@ -74,8 +91,15 @@ def add_clicks(uid, amount):
     conn.commit()
 
 def add_click(uid):
-    cur.execute("UPDATE users SET balance = balance + 1, total_clicks = total_clicks + 1 WHERE user_id=?", (uid,))
+    """Клик с учётом множителя"""
+    u = get_user(uid)
+    if not u:
+        return 0
+    mult = u[6] or 1
+    cur.execute("UPDATE users SET balance = balance + ?, total_clicks = total_clicks + 1 WHERE user_id=?",
+                (mult, uid))
     conn.commit()
+    return mult
 
 def find_by_username(username):
     username = username.replace("@", "").lower()
@@ -94,6 +118,37 @@ def get_top(limit=10):
 def get_all_users():
     cur.execute("SELECT user_id FROM users")
     return [r[0] for r in cur.fetchall()]
+
+# ---------- УЛУЧШЕНИЯ (логика) ----------
+def has_upgrade(uid, key):
+    cur.execute("SELECT 1 FROM user_upgrades WHERE user_id=? AND upgrade_key=?", (uid, key))
+    return cur.fetchone() is not None
+
+def buy_upgrade(uid, key):
+    if key not in UPGRADES:
+        return "❌ Неизвестное улучшение."
+    if has_upgrade(uid, key):
+        return "❌ У тебя уже есть это улучшение."
+    u = get_user(uid)
+    price = UPGRADES[key]["price"]
+    if u[3] < price:
+        return f"❌ Не хватает денег. Нужно ${price}, у тебя ${u[3]}."
+    # Списываем деньги
+    cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, uid))
+    # Добавляем улучшение
+    cur.execute("INSERT INTO user_upgrades (user_id, upgrade_key) VALUES (?,?)", (uid, key))
+    # Пересчитываем множитель (перемножаем все улучшения)
+    cur.execute("SELECT upgrade_key FROM user_upgrades WHERE user_id=?", (uid,))
+    keys = [r[0] for r in cur.fetchall()]
+    mult = 1
+    for k in keys:
+        mult *= UPGRADES[k]["mult"]
+    cur.execute("UPDATE users SET click_mult=? WHERE user_id=?", (mult, uid))
+    conn.commit()
+    return f"✅ Куплено улучшение! Теперь клик даёт ${mult}."
+
+def upgrades_list(uid):
+    return [k for k in UPGRADES if has_upgrade(uid, k)]
 
 # ---------- ПРОМО ----------
 def create_promo(code, amount, max_uses):
@@ -149,8 +204,18 @@ def main_menu(uid):
 
 def clicker_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("💵 Кликнуть (+$1)"))
+    kb.row(KeyboardButton("💵 Кликнуть"))
+    kb.row(KeyboardButton("⚡ Улучшения"))
     kb.row(KeyboardButton("🔙 В меню"))
+    return kb
+
+def upgrades_kb(uid):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    for key, info in UPGRADES.items():
+        if has_upgrade(uid, key):
+            continue
+        kb.row(KeyboardButton(f"{info['emoji']} {key} за клик — ${info['price']}"))
+    kb.row(KeyboardButton("🔙 Назад"))
     return kb
 
 def back_menu():
@@ -202,16 +267,63 @@ def play(message):
         bot.send_message(uid, "🚫 Вы забанены.")
         return
     u = get_user(uid)
-    bot.send_message(uid, f"💵 Баланс: ${u[3]}\n\nЖми кнопку и зарабатывай!", reply_markup=clicker_kb())
+    mult = u[6] or 1
+    bot.send_message(
+        uid,
+        f"💵 Баланс: ${u[3]}\n"
+        f"⚡ Множитель: x{mult}\n\n"
+        f"Жми кнопку и зарабатывай!",
+        reply_markup=clicker_kb()
+    )
 
-@bot.message_handler(func=lambda m: m.text == "💵 Кликнуть (+$1)")
+@bot.message_handler(func=lambda m: m.text == "💵 Кликнуть")
 def click(message):
     uid = message.from_user.id
     if is_banned(uid):
         return
-    add_click(uid)
+    mult = add_click(uid)
     u = get_user(uid)
-    bot.send_message(uid, f"💵 +$1\nБаланс: ${u[3]}")
+    bot.send_message(uid, f"💵 +${mult}\nБаланс: ${u[3]}")
+
+# ---------- ⚡ УЛУЧШЕНИЯ ----------
+@bot.message_handler(func=lambda m: m.text == "⚡ Улучшения")
+def upgrades_show(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    u = get_user(uid)
+    own = upgrades_list(uid)
+    if own:
+        own_text = ", ".join(own)
+    else:
+        own_text = "нет"
+    bot.send_message(
+        uid,
+        f"⚡ <b>Улучшения</b>\n\n"
+        f"Твой баланс: ${u[3]}\n"
+        f"Твой множитель: x{u[6] or 1}\n"
+        f"Куплено: {own_text}\n\n"
+        f"Выбери улучшение:",
+        parse_mode="HTML",
+        reply_markup=upgrades_kb(uid)
+    )
+
+@bot.message_handler(func=lambda m: any(m.text and m.text.startswith(f"{info['emoji']} {key} за клик") for key, info in UPGRADES.items()))
+def buy_upgrade_handler(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    # Извлекаем ключ
+    key = None
+    for k, info in UPGRADES.items():
+        if message.text.startswith(f"{info['emoji']} {k} за клик"):
+            key = k
+            break
+    if not key:
+        return
+    result = buy_upgrade(uid, key)
+    u = get_user(uid)
+    bot.send_message(uid, result, reply_markup=clicker_kb())
 
 # ---------- 🎭 ДОКС ----------
 @bot.message_handler(func=lambda m: m.text == "🎭 Докс")
@@ -297,6 +409,7 @@ def profile(message):
         f"ID: <code>{uid}</code>\n"
         f"Баланс: ${u[3]}\n"
         f"Всего накликано: {u[4]}\n"
+        f"Множитель: x{u[6] or 1}\n"
         f"Статус: {status}",
         parse_mode="HTML"
     )
@@ -354,10 +467,23 @@ def send_support(message):
             pass
     bot.send_message(message.chat.id, "✅ Отправлено администратору.", reply_markup=main_menu(message.from_user.id))
 
-# ---------- 🔙 В МЕНЮ ----------
+# ---------- 🔙 НАВИГАЦИЯ ----------
 @bot.message_handler(func=lambda m: m.text == "🔙 В меню")
 def back(message):
     bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu(message.from_user.id))
+
+@bot.message_handler(func=lambda m: m.text == "🔙 Назад")
+def back_to_clicker(message):
+    uid = message.from_user.id
+    if is_admin(uid) and False:
+        return
+    u = get_user(uid)
+    mult = u[6] if u else 1
+    bot.send_message(
+        uid,
+        f"💵 Баланс: ${u[3] if u else 0}\n⚡ Множитель: x{mult}\n\nЖми кнопку и зарабатывай!",
+        reply_markup=clicker_kb()
+    )
 
 # ---------- 🔧 АДМИН ----------
 @bot.message_handler(func=lambda m: m.text == "🔧 Админ-панель")
@@ -520,12 +646,6 @@ def promo_delete_step(message):
     delete_promo(code)
     bot.send_message(message.chat.id, f"✅ Промокод <code>{code}</code> удалён.", parse_mode="HTML",
                      reply_markup=promos_admin_menu())
-
-@bot.message_handler(func=lambda m: m.text == "🔙 Назад")
-def promos_back(message):
-    if not is_admin(message.from_user.id):
-        return
-    bot.send_message(message.chat.id, "🔧 Админ-панель", reply_markup=admin_menu())
 
 @bot.message_handler(func=lambda m: m.text == "📢 Рассылка")
 def broadcast(message):
