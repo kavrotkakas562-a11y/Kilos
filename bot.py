@@ -587,6 +587,14 @@ def unban_step(message):
     except:
         pass
 
+# ---------- FALLBACK (автообновление меню) ----------
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    bot.send_message(uid, "Выбери действие 👇", reply_markup=main_menu(uid))
+
 # ---------- ЗАПУСК ----------
 print("Бот запущен...")
 bot.infinity_polling()
