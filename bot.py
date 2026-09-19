@@ -1,8 +1,8 @@
 import os
 import random
 import telebot
-import psycopg2
-from psycopg2 import pool
+import psycopg
+from psycopg import pool
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
@@ -23,7 +23,7 @@ def is_admin(uid):
 bot = telebot.TeleBot(TOKEN)
 
 # ---------- ПУЛ СОЕДИНЕНИЙ ----------
-db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+db_pool = pool.ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
 
 def get_conn():
     return db_pool.getconn()
@@ -157,20 +157,19 @@ def get_all_users():
 
 # ---------- ПРОМО ----------
 def create_promo(code, amount, max_uses):
+    conn = get_conn()
+    cur = conn.cursor()
     try:
-        conn = get_conn()
-        cur = conn.cursor()
         cur.execute("INSERT INTO promos (code, amount, max_uses, uses) VALUES (%s,%s,%s,0)",
                     (code.upper(), amount, max_uses))
         conn.commit()
-        cur.close()
-        release_conn(conn)
         return True
-    except psycopg2.IntegrityError:
+    except psycopg.IntegrityError:
         conn.rollback()
+        return False
+    finally:
         cur.close()
         release_conn(conn)
-        return False
 
 def get_promo(code):
     conn = get_conn()
